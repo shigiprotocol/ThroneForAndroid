@@ -1,0 +1,294 @@
+name: Build Throne with exit IP
+# Paste this one file into your fork as .github/workflows/build-exit-ip.yml, then Actions > this workflow > Run workflow.
+# It applies the "exit IP after ping" change, builds with a throwaway signing key (no secrets needed) and uploads the
+# APKs. Package name gets ".ip" so it installs next to the official app; the in-app updater is off (F-Droid flavor).
+on:
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+      - name: Apply the exit-IP change
+        run: |
+          cat > "$RUNNER_TEMP/exit-ip.patch" <<'PATCH_EOF'
+          diff --git a/app/src/main/java/io/nekohasekai/sagernet/bg/test/IpTestRunner.kt b/app/src/main/java/io/nekohasekai/sagernet/bg/test/IpTestRunner.kt
+          index 42ee125..645cd32 100644
+          --- a/app/src/main/java/io/nekohasekai/sagernet/bg/test/IpTestRunner.kt
+          +++ b/app/src/main/java/io/nekohasekai/sagernet/bg/test/IpTestRunner.kt
+          @@ -5,8 +5,11 @@ import io.nekohasekai.sagernet.database.ProxyEntity
+           import io.throneproj.mobile.IPTestHandler
+           import io.throneproj.mobile.Mobile
+           
+          -/** Egress IP and country tests (runIpProbe, TestRunner.cpp:234-293): results stream as the core reports them. */
+          -internal class IpTestRunner(session: TestSession) : LatencySweep(session) {
+          +/**
+          + * Egress IP and country tests (runIpProbe, TestRunner.cpp:234-293): results stream as the core reports them. With
+          + * [exitLookup] it is the lookup that follows a URL test: results only add the IP and country to the profiles.
+          + */
+          +internal class IpTestRunner(session: TestSession, private val exitLookup: Boolean = false) : LatencySweep(session) {
+           
+               override fun start(probe: TestProbe, batch: List<ProxyEntity>, emit: (ProbeResult) -> Unit, done: () -> Unit) {
+                   val request = probe.request().apply {
+          @@ -23,7 +26,8 @@ internal class IpTestRunner(session: TestSession) : LatencySweep(session) {
+                   })
+               }
+           
+          -    override fun report(results: List<ProbeResult>) = session.reportIp(results)
+          +    override fun report(results: List<ProbeResult>) =
+          +        if (exitLookup) session.reportExitLookup(results) else session.reportIp(results)
+           
+               /** Not tested: the desktop only flags the latency in memory for an invalid candidate. */
+               override fun invalid(profileId: Long, reason: String) = ProbeResult(profileId, error = reason, measured = false)
+          diff --git a/app/src/main/java/io/nekohasekai/sagernet/bg/test/TestSession.kt b/app/src/main/java/io/nekohasekai/sagernet/bg/test/TestSession.kt
+          index 7864a3f..275bbdc 100644
+          --- a/app/src/main/java/io/nekohasekai/sagernet/bg/test/TestSession.kt
+          +++ b/app/src/main/java/io/nekohasekai/sagernet/bg/test/TestSession.kt
+          @@ -175,13 +175,29 @@ internal class TestSession(
+                       TestSpec.KIND_URL -> {
+                           UrlTestRunner(this).run(profiles)
+                           autoClearUnavailable(profiles)
+          +                lookupExitIps(profiles)
+                       }
+           
+                       TestSpec.KIND_IP -> IpTestRunner(this).run(profiles)
+          -            TestSpec.KIND_SPEED -> SpeedTestRunner(this).run(profiles)
+          +            TestSpec.KIND_SPEED -> {
+          +                SpeedTestRunner(this).run(profiles)
+          +                if (options.speedMode == SpeedTestSettings.COUNTRY) lookupExitIps(profiles)
+          +            }
+                   }
+               }
+           
+          +    /**
+          +     * `test_lookup_exit_ip`: the profiles the latency test found working are looked up for their exit IP and country,
+          +     * shown next to the latency (an IP test of just those, which keeps the latency and error already stored).
+          +     */
+          +    private suspend fun lookupExitIps(profiles: List<ProxyEntity>) {
+          +        if (cancelled || !DataStore.testLookupExitIp) return
+          +        val working = ProfileManager.getProfiles(profiles.map { it.id }).filter { it.isWorking() && it.latency > 0 }
+          +        if (working.isEmpty()) return
+          +        val byId = working.associateBy { it.id }
+          +        IpTestRunner(this, exitLookup = true).run(profiles.mapNotNull { byId[it.id] })
+          +    }
+          +
+               private suspend fun runCurrent() {
+                   started(1)
+                   val running = CoreRuntime.running
+          @@ -271,6 +287,18 @@ internal class TestSession(
+                   }
+               }
+           
+          +    /** The exit lookup after a URL test: a found IP / country is stored and shown; nothing is counted again. */
+          +    fun reportExitLookup(results: List<ProbeResult>) {
+          +        val found = results.filter { it.measured && it.error.isEmpty() && (it.ip.isNotEmpty() || it.country.isNotEmpty()) }
+          +        for (result in results) {
+          +            if (result.measured && result.error.isNotEmpty() && !ProxyEntity.isTestAborted(result.error)) {
+          +                Logs.w("[${nameOf(result.profileId)}] exit IP lookup error: ${result.error}")
+          +            }
+          +        }
+          +        persist(found) { ProfileManager.saveExitLookup(it.profileId, it.ip, it.country) }
+          +        for (result in found) notifyClient { it.onIpResult(result.profileId, result.ip, result.country, "") }
+          +    }
+          +
+               /**
+                * The speed result loop of TestRunner.cpp:632-647 (the server's country name mapped to its code); the callback
+                * carries the values as stored.
+          diff --git a/app/src/main/java/io/nekohasekai/sagernet/database/DataStore.kt b/app/src/main/java/io/nekohasekai/sagernet/database/DataStore.kt
+          index d3e69d4..45b24f1 100644
+          --- a/app/src/main/java/io/nekohasekai/sagernet/database/DataStore.kt
+          +++ b/app/src/main/java/io/nekohasekai/sagernet/database/DataStore.kt
+          @@ -244,6 +244,7 @@ object DataStore : OnPreferenceDataStoreChangeListener {
+               var urlTestTimeoutMs by SettingsRegistry.URL_TEST_TIMEOUT_MS
+               var testConcurrent by SettingsRegistry.TEST_CONCURRENT
+               var directTestUrl by SettingsRegistry.DIRECT_TEST_URL
+          +    var testLookupExitIp by SettingsRegistry.TEST_LOOKUP_EXIT_IP
+               var exitCountryLookup by SettingsRegistry.EXIT_COUNTRY_LOOKUP
+               var exitLookupProvider by SettingsRegistry.EXIT_LOOKUP_PROVIDER
+               var speedTestMode by SettingsRegistry.SPEED_TEST_MODE
+          diff --git a/app/src/main/java/io/nekohasekai/sagernet/database/ProfileManager.kt b/app/src/main/java/io/nekohasekai/sagernet/database/ProfileManager.kt
+          index b1119cc..271a919 100644
+          --- a/app/src/main/java/io/nekohasekai/sagernet/database/ProfileManager.kt
+          +++ b/app/src/main/java/io/nekohasekai/sagernet/database/ProfileManager.kt
+          @@ -355,6 +355,14 @@ object ProfileManager {
+                   return profile
+               }
+           
+          +    /** The exit lookup after a URL test ([ProxyEntity.applyExitLookup]). */
+          +    fun saveExitLookup(profileId: Long, ip: String, country: String): ProxyEntity? {
+          +        val profile = getProfile(profileId) ?: return null
+          +        profile.applyExitLookup(ip, country)
+          +        saveTestResult(profile)
+          +        return profile
+          +    }
+          +
+               /** The speed-test result loop of TestRunner.cpp:614-648; [country] is an ISO code. */
+               fun saveSpeedTestResult(
+                   profileId: Long,
+          diff --git a/app/src/main/java/io/nekohasekai/sagernet/database/ProxyEntity.kt b/app/src/main/java/io/nekohasekai/sagernet/database/ProxyEntity.kt
+          index b70838b..2000af0 100644
+          --- a/app/src/main/java/io/nekohasekai/sagernet/database/ProxyEntity.kt
+          +++ b/app/src/main/java/io/nekohasekai/sagernet/database/ProxyEntity.kt
+          @@ -169,10 +169,22 @@ data class ProxyEntity(
+                       else -> {
+                           recordLatency(-1)
+                           testError = error
+          +                // A dead server keeps no stale flag / exit IP from an earlier test.
+          +                testCountry = null
+          +                ipOut = null
+                       }
+                   }
+               }
+           
+          +    /**
+          +     * The exit lookup that follows a URL test: fills in the egress IP and country, never touching the latency or
+          +     * error the URL test stored; a failed lookup leaves the profile as it is.
+          +     */
+          +    fun applyExitLookup(ip: String, country: String) {
+          +        if (ip.isNotEmpty()) ipOut = ip
+          +        if (country.isNotEmpty()) testCountry = country
+          +    }
+          +
+               /** TestRunner::applyIpResult (TestRunner.cpp:144-157): an error clears the egress IP and country. */
+               fun applyIpResult(ip: String, country: String, error: String) {
+                   if (error.isEmpty()) {
+          diff --git a/app/src/main/java/io/nekohasekai/sagernet/database/SettingsRegistry.kt b/app/src/main/java/io/nekohasekai/sagernet/database/SettingsRegistry.kt
+          index 8d44ff2..5710cb3 100644
+          --- a/app/src/main/java/io/nekohasekai/sagernet/database/SettingsRegistry.kt
+          +++ b/app/src/main/java/io/nekohasekai/sagernet/database/SettingsRegistry.kt
+          @@ -251,6 +251,8 @@ object SettingsRegistry {
+               @JvmField val URL_TEST_TIMEOUT_MS = int("url_test_timeout_ms", 3000) { it > 0 }
+               @JvmField val TEST_CONCURRENT = int("test_concurrent", 10) { it > 0 }
+               @JvmField val DIRECT_TEST_URL = string("direct_test_url", "")
+          +    /** After a URL test (or a country-mode speed test), look up the exit IP and country of every working profile. */
+          +    @JvmField val TEST_LOOKUP_EXIT_IP = bool("test_lookup_exit_ip", true)
+               /** The exit country of the running connection (widget/ExitIp.kt); off never asks a lookup service on its own. */
+               @JvmField val EXIT_COUNTRY_LOOKUP = bool("exit_country_lookup", true)
+               /** "auto" or one service id of ExitIp; an id this build does not know (a newer desktop's) runs as "auto". */
+          diff --git a/app/src/main/java/io/nekohasekai/sagernet/ui/profiles/ProfileListAdapter.kt b/app/src/main/java/io/nekohasekai/sagernet/ui/profiles/ProfileListAdapter.kt
+          index 97828f0..5e2ffac 100644
+          --- a/app/src/main/java/io/nekohasekai/sagernet/ui/profiles/ProfileListAdapter.kt
+          +++ b/app/src/main/java/io/nekohasekai/sagernet/ui/profiles/ProfileListAdapter.kt
+          @@ -257,14 +257,23 @@ internal class ProfileListAdapter(private val fragment: ProfileListFragment) :
+           
+               /** Queued / testing rows of a running session; results arrive through the database. */
+               fun onTestState(state: TestUiState) {
+          +        val oldState = testState
+                   testState = state
+          +        // The exit lookup after a latency test reports an IP / country for rows already done: :bg stored it first.
+          +        val lookedUp = if (oldState == null || oldState.rows === state.rows) emptyList() else memberIds.filter { id ->
+          +            val row = state.rows[id] ?: return@filter false
+          +            val before = oldState.rows[id]
+          +            row.phase == RowPhase.DONE && before?.phase == RowPhase.DONE &&
+          +                (row.ip != before.ip || row.country != before.country)
+          +        }
+                   val old = phases
+                   phases = computePhases()
+          -        if (phases == old) return
+          -        ids.forEachIndexed { index, id -> if (old[id] != phases[id]) notifyItemChanged(index, PAYLOAD_CONTENT) }
+          +        if (phases != old) {
+          +            ids.forEachIndexed { index, id -> if (old[id] != phases[id]) notifyItemChanged(index, PAYLOAD_CONTENT) }
+          +        }
+                   // :bg stored the result before reporting it: show it now rather than at the next table reload
+          -        val finished = old.keys.filter { it !in phases }
+          -        if (finished.isNotEmpty()) refreshEntities(finished)
+          +        val refresh = old.keys.filter { it !in phases } + lookedUp
+          +        if (refresh.isNotEmpty()) refreshEntities(refresh.distinct())
+               }
+           
+               private fun refreshEntities(profileIds: List<Long>) {
+          diff --git a/app/src/main/java/io/nekohasekai/sagernet/ui/test/TestSessionModel.kt b/app/src/main/java/io/nekohasekai/sagernet/ui/test/TestSessionModel.kt
+          index 64ffed0..3973c27 100644
+          --- a/app/src/main/java/io/nekohasekai/sagernet/ui/test/TestSessionModel.kt
+          +++ b/app/src/main/java/io/nekohasekai/sagernet/ui/test/TestSessionModel.kt
+          @@ -138,6 +138,19 @@ internal class TestSessionModel(
+               }
+           
+               fun onIpResult(profileId: Long, ip: String, country: String, error: String) {
+          +        if (kind != TestSpec.KIND_IP) {
+          +            // The exit lookup after a latency test: the row keeps its result and counts, gaining the IP / country.
+          +            val id = resolve(profileId)
+          +            val row = rows[id] ?: return
+          +            if (row.phase != RowPhase.DONE) return
+          +            rows[id] = row.copy(ip = ip.ifEmpty { row.ip }, country = country.ifEmpty { row.country })
+          +            rowsDirty = true
+          +            if (country.isNotEmpty()) working[id]?.let {
+          +                working[id] = it.copy(country = country)
+          +                rankingDirty = true
+          +            }
+          +            return
+          +        }
+                   val ok = error.isEmpty()
+                   val aborted = !ok && ProxyEntity.isTestAborted(error)
+                   put(
+          diff --git a/app/src/main/res/values-fa/strings.xml b/app/src/main/res/values-fa/strings.xml
+          index 78c63e3..4273a10 100644
+          --- a/app/src/main/res/values-fa/strings.xml
+          +++ b/app/src/main/res/values-fa/strings.xml
+          @@ -2384,4 +2384,6 @@
+               <string name="validation_route_dns_dropped">تنظیمات DNS اختصاصی پروفایل کنار گذاشته شد، بنابراین از تنظیمات سراسری استفاده می‌کند: %1$s</string>
+               <string name="route_dns_global_servers">ریموت %1$s، مستقیم %2$s</string>
+               <string name="dns_server_suggestions">سرورهای اخیر و پیشنهادی</string>
+          +    <string name="test_lookup_exit_ip">نمایش IP خروجی بعد از تست پینگ</string>
+          +    <string name="test_lookup_exit_ip_sum">بعد از تست URL (یا تست سرعت در حالت کشور)، از طریق هر پروفایل سالم IP و کشور خروجی را از یک سرویس IP می‌پرسد و کنار پینگ نشان می‌دهد.</string>
+           </resources>
+          diff --git a/app/src/main/res/values/strings.xml b/app/src/main/res/values/strings.xml
+          index f9bd29e..908f142 100644
+          --- a/app/src/main/res/values/strings.xml
+          +++ b/app/src/main/res/values/strings.xml
+          @@ -2581,4 +2581,6 @@
+               <string name="validation_route_dns_dropped">The profile\'s own DNS settings were dropped, so it uses the global ones: %1$s</string>
+               <string name="route_dns_global_servers">Remote %1$s, direct %2$s</string>
+               <string name="dns_server_suggestions">Recent and suggested servers</string>
+          +    <string name="test_lookup_exit_ip">Show exit IP after URL test</string>
+          +    <string name="test_lookup_exit_ip_sum">After a URL test (or a country-mode speed test), ask an IP lookup service through each working profile for its exit IP and country, and show them next to the latency.</string>
+           </resources>
+          diff --git a/app/src/main/res/xml/settings_testing.xml b/app/src/main/res/xml/settings_testing.xml
+          index eeb6642..a9063d0 100644
+          --- a/app/src/main/res/xml/settings_testing.xml
+          +++ b/app/src/main/res/xml/settings_testing.xml
+          @@ -10,6 +10,11 @@
+                       app:dialogMessage="@string/direct_test_url_sum"
+                       app:key="direct_test_url"
+                       app:title="@string/direct_test_url" />
+          +        <SwitchPreference
+          +            app:icon="@drawable/baseline_public_24"
+          +            app:key="test_lookup_exit_ip"
+          +            app:summary="@string/test_lookup_exit_ip_sum"
+          +            app:title="@string/test_lookup_exit_ip" />
+               </PreferenceCategory>
+           
+               <PreferenceCategory app:title="@string/cag_exit_country">
+          
+          PATCH_EOF
+          git apply --whitespace=nowarn "$RUNNER_TEMP/exit-ip.patch"
+          git diff --stat
+      - name: Package name and throwaway signing key
+        run: |
+          set -euo pipefail
+          sed -i 's/^PACKAGE_NAME=\(.*\)$/PACKAGE_NAME=\1.ip/' nb4a.properties
+          grep '^PACKAGE_NAME=' nb4a.properties
+          PASS=$(openssl rand -hex 16)
+          keytool -genkeypair -noprompt -keystore "$RUNNER_TEMP/fork.jks" -storetype PKCS12 -storepass "$PASS" \
+            -keypass "$PASS" -alias fork -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=Throne fork"
+          {
+            echo "SIGNING_KEYSTORE_B64=$(base64 -w0 "$RUNNER_TEMP/fork.jks")"
+            echo "SIGNING_STORE_PASSWORD=$PASS"
+            echo "SIGNING_KEY_ALIAS=fork"
+            echo "SIGNING_KEY_PASSWORD=$PASS"
+          } >> "$GITHUB_ENV"
+      - name: Build
+        uses: ./.github/actions/android-build
+        with:
+          tasks: app:assembleFdroidRelease
+          channel: stable
+          build-number: '999'
+          sign: 'true'
+      - name: Upload APKs
+        uses: actions/upload-artifact@v7
+        with:
+          name: Throne-exit-ip
+          path: app/build/outputs/apk/fdroid/release/*.apk
+          if-no-files-found: error
+          retention-days: 14
