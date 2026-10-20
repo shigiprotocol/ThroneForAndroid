@@ -223,6 +223,45 @@ jobs:
                    val ok = error.isEmpty()
                    val aborted = !ok && ProxyEntity.isTestAborted(error)
                    put(
+          diff --git a/app/src/main/java/io/nekohasekai/sagernet/widget/StatsBar.kt b/app/src/main/java/io/nekohasekai/sagernet/widget/StatsBar.kt
+          index 4c7f309..80f1cc5 100644
+          --- a/app/src/main/java/io/nekohasekai/sagernet/widget/StatsBar.kt
+          +++ b/app/src/main/java/io/nekohasekai/sagernet/widget/StatsBar.kt
+          @@ -190,7 +190,7 @@ class StatsBar @JvmOverloads constructor(
+               }
+           
+               /**
+          -     * runningCountryInfo (mainwindow_view.cpp:151-165): the exit's flag and country, no IP or city. Hidden while
+          +     * runningCountryInfo (mainwindow_view.cpp:151-165): the exit's flag and country, then its IP. Hidden while
+                * exit_country_lookup is off: ExitIp then holds no result and runs no lookup, a tap's refresh() included.
+                */
+               private fun showExit() {
+          @@ -211,8 +211,10 @@ class StatsBar @JvmOverloads constructor(
+                           info.country
+                       }
+                       val flag = TestFormat.flag(info.countryCode)
+          -            view.text = if (flag.isEmpty()) country else "$flag\u00A0$country"
+          -            view.contentDescription = country
+          +            val place = if (flag.isEmpty()) country else "$flag\u00A0$country"
+          +            // The exit IP under the flag and country.
+          +            view.text = if (info.ip.isEmpty()) place else "$place\n${info.ip}"
+          +            view.contentDescription = if (info.ip.isEmpty()) country else "$country, ${info.ip}"
+                       view.isVisible = true
+                   }
+                   updateTooltip()
+          diff --git a/app/src/main/res/layout/layout_stats_bar_content.xml b/app/src/main/res/layout/layout_stats_bar_content.xml
+          index a2d9665..79a9fde 100644
+          --- a/app/src/main/res/layout/layout_stats_bar_content.xml
+          +++ b/app/src/main/res/layout/layout_stats_bar_content.xml
+          @@ -49,7 +49,7 @@
+                       android:layout_weight="1"
+                       android:ellipsize="end"
+                       android:gravity="end"
+          -            android:singleLine="true"
+          +            android:maxLines="2"
+                       android:textColor="?whiteOrTextPrimary"
+                       android:textSize="14sp"
+                       android:visibility="gone"
           diff --git a/app/src/main/res/values-fa/strings.xml b/app/src/main/res/values-fa/strings.xml
           index 78c63e3..4273a10 100644
           --- a/app/src/main/res/values-fa/strings.xml
