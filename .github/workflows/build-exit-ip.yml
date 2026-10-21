@@ -15,7 +15,7 @@ jobs:
         run: |
           cat > "$RUNNER_TEMP/exit-ip.patch" <<'PATCH_EOF'
           diff --git a/app/src/main/java/io/nekohasekai/sagernet/bg/test/IpTestRunner.kt b/app/src/main/java/io/nekohasekai/sagernet/bg/test/IpTestRunner.kt
-          index 42ee1250..645cd327 100644
+          index 42ee125..645cd32 100644
           --- a/app/src/main/java/io/nekohasekai/sagernet/bg/test/IpTestRunner.kt
           +++ b/app/src/main/java/io/nekohasekai/sagernet/bg/test/IpTestRunner.kt
           @@ -5,8 +5,11 @@ import io.nekohasekai.sagernet.database.ProxyEntity
@@ -42,8 +42,41 @@ jobs:
            
                /** Not tested: the desktop only flags the latency in memory for an invalid candidate. */
                override fun invalid(profileId: Long, reason: String) = ProbeResult(profileId, error = reason, measured = false)
+          diff --git a/app/src/main/java/io/nekohasekai/sagernet/bg/test/TestEngine.kt b/app/src/main/java/io/nekohasekai/sagernet/bg/test/TestEngine.kt
+          index 8f879c2..a22b94a 100644
+          --- a/app/src/main/java/io/nekohasekai/sagernet/bg/test/TestEngine.kt
+          +++ b/app/src/main/java/io/nekohasekai/sagernet/bg/test/TestEngine.kt
+          @@ -27,6 +27,12 @@ object TestEngine {
+               @Volatile
+               private var current: TestSession? = null
+           
+          +    /** [queueUrlTests] calls waiting for the session lock (auto-selector ranking, subscription follow-ups). */
+          +    private val waiting = AtomicInteger()
+          +
+          +    /** Whether a background URL test waits for the lock: the optional exit IP lookup then gives way. */
+          +    fun backgroundWaiting(): Boolean = waiting.get() > 0
+          +
+               /** Starts a session and returns its id, or -1 while another session runs. */
+               fun start(spec: TestSpec, callback: ITestSessionCallback): Int {
+                   if (!session.tryLock()) return -1
+          @@ -70,7 +76,14 @@ object TestEngine {
+                */
+               suspend fun queueUrlTests(ids: List<Long>) {
+                   if (ids.isEmpty()) return
+          -        session.lock()
+          +        waiting.incrementAndGet()
+          +        try {
+          +            // A UI test that is only looking up exit IPs ends now instead of delaying this connection.
+          +            current?.yieldExitLookup()
+          +            session.lock()
+          +        } finally {
+          +            waiting.decrementAndGet()
+          +        }
+                   val test = TestSession(sessionIds.incrementAndGet(), TestSpec(TestSpec.KIND_URL, ids.toLongArray()), null)
+                   current = test
+                   try {
           diff --git a/app/src/main/java/io/nekohasekai/sagernet/bg/test/TestSession.kt b/app/src/main/java/io/nekohasekai/sagernet/bg/test/TestSession.kt
-          index 7864a3ff..be272d50 100644
+          index 7864a3f..d8f246d 100644
           --- a/app/src/main/java/io/nekohasekai/sagernet/bg/test/TestSession.kt
           +++ b/app/src/main/java/io/nekohasekai/sagernet/bg/test/TestSession.kt
           @@ -63,6 +63,13 @@ internal class TestSession(
@@ -60,7 +93,43 @@ jobs:
                @Volatile
                var total = 0
                    private set
-          @@ -175,13 +182,29 @@ internal class TestSession(
+          @@ -93,6 +100,26 @@ internal class TestSession(
+                   Mobile.stopTests()
+               }
+           
+          +    /** The exit IP lookup after the URL test is running; its results only add an IP / country. */
+          +    @Volatile
+          +    private var lookingUpExit = false
+          +
+          +    /** [yieldExitLookup] cut the lookup short: the session ends as done, not as stopped by the user. */
+          +    @Volatile
+          +    private var exitYielded = false
+          +
+          +    /**
+          +     * Called by [TestEngine.queueUrlTests] before it waits for the session lock: an auto-selector ranking at connect
+          +     * time (or a subscription follow-up) must not wait for the optional exit IP lookup, so the lookup ends now. The URL
+          +     * results are already stored. Does nothing outside the lookup or after a user stop.
+          +     */
+          +    fun yieldExitLookup() {
+          +        if (!lookingUpExit || cancelled) return
+          +        exitYielded = true
+          +        Logs.i("Exit IP lookup stopped early: a connection is waiting for the test engine")
+          +        stop()
+          +    }
+          +
+               suspend fun run() {
+                   notification.start()
+                   try {
+          @@ -112,7 +139,7 @@ internal class TestSession(
+                   } finally {
+                       repositionTested()
+                       notification.finish(assetProblems)
+          -            notifyClient { it.onDone(id, cancelled) }
+          +            notifyClient { it.onDone(id, cancelled && !exitYielded) }
+                   }
+               }
+           
+          @@ -175,10 +202,34 @@ internal class TestSession(
                        TestSpec.KIND_URL -> {
                            UrlTestRunner(this).run(profiles)
                            autoClearUnavailable(profiles)
@@ -73,9 +142,9 @@ jobs:
           +                SpeedTestRunner(this).run(profiles)
           +                if (options.speedMode == SpeedTestSettings.COUNTRY) lookupExitIps(profiles)
           +            }
-                   }
-               }
-           
+          +        }
+          +    }
+          +
           +    /**
           +     * `test_lookup_exit_ip`: the profiles the latency test found working are looked up for their exit IP and country,
           +     * shown next to the latency (an IP test of just those, which keeps the latency and error already stored).
@@ -85,13 +154,18 @@ jobs:
           +        val working = ProfileManager.getProfiles(profiles.map { it.id }).filter { it.isWorking() && it.latency > 0 }
           +        if (working.isEmpty()) return
           +        val byId = working.associateBy { it.id }
-          +        IpTestRunner(this, exitLookup = true).run(profiles.mapNotNull { byId[it.id] })
-          +    }
-          +
-               private suspend fun runCurrent() {
-                   started(1)
-                   val running = CoreRuntime.running
-          @@ -271,6 +294,18 @@ internal class TestSession(
+          +        // Flag first, then look for a waiter: TestEngine.queueUrlTests counts itself first, then looks at the flag,
+          +        // so one of the two always sees the other (both volatile) and a connection never waits on the lookup.
+          +        lookingUpExit = true
+          +        try {
+          +            if (TestEngine.backgroundWaiting()) return
+          +            IpTestRunner(this, exitLookup = true).run(profiles.mapNotNull { byId[it.id] })
+          +        } finally {
+          +            lookingUpExit = false
+                   }
+               }
+           
+          @@ -271,6 +322,18 @@ internal class TestSession(
                    }
                }
            
@@ -111,7 +185,7 @@ jobs:
                 * The speed result loop of TestRunner.cpp:632-647 (the server's country name mapped to its code); the callback
                 * carries the values as stored.
           diff --git a/app/src/main/java/io/nekohasekai/sagernet/database/DataStore.kt b/app/src/main/java/io/nekohasekai/sagernet/database/DataStore.kt
-          index d3e69d46..e279ec9f 100644
+          index d3e69d4..e279ec9 100644
           --- a/app/src/main/java/io/nekohasekai/sagernet/database/DataStore.kt
           +++ b/app/src/main/java/io/nekohasekai/sagernet/database/DataStore.kt
           @@ -244,6 +244,7 @@ object DataStore : OnPreferenceDataStoreChangeListener {
@@ -131,7 +205,7 @@ jobs:
                var xrayGeositeUrl by SettingsRegistry.XRAY_GEOSITE_URL
                var skipCert by SettingsRegistry.SKIP_CERT
           diff --git a/app/src/main/java/io/nekohasekai/sagernet/database/ProfileManager.kt b/app/src/main/java/io/nekohasekai/sagernet/database/ProfileManager.kt
-          index b1119cc2..271a919b 100644
+          index b1119cc..271a919 100644
           --- a/app/src/main/java/io/nekohasekai/sagernet/database/ProfileManager.kt
           +++ b/app/src/main/java/io/nekohasekai/sagernet/database/ProfileManager.kt
           @@ -355,6 +355,14 @@ object ProfileManager {
@@ -150,7 +224,7 @@ jobs:
                fun saveSpeedTestResult(
                    profileId: Long,
           diff --git a/app/src/main/java/io/nekohasekai/sagernet/database/ProxyEntity.kt b/app/src/main/java/io/nekohasekai/sagernet/database/ProxyEntity.kt
-          index b70838b9..6194bbdf 100644
+          index b70838b..6194bbd 100644
           --- a/app/src/main/java/io/nekohasekai/sagernet/database/ProxyEntity.kt
           +++ b/app/src/main/java/io/nekohasekai/sagernet/database/ProxyEntity.kt
           @@ -173,6 +173,15 @@ data class ProxyEntity(
@@ -170,7 +244,7 @@ jobs:
                fun applyIpResult(ip: String, country: String, error: String) {
                    if (error.isEmpty()) {
           diff --git a/app/src/main/java/io/nekohasekai/sagernet/database/SettingsRegistry.kt b/app/src/main/java/io/nekohasekai/sagernet/database/SettingsRegistry.kt
-          index 8d44ff29..1eb6ee01 100644
+          index 8d44ff2..1eb6ee0 100644
           --- a/app/src/main/java/io/nekohasekai/sagernet/database/SettingsRegistry.kt
           +++ b/app/src/main/java/io/nekohasekai/sagernet/database/SettingsRegistry.kt
           @@ -251,6 +251,8 @@ object SettingsRegistry {
@@ -192,7 +266,7 @@ jobs:
                @JvmField val XRAY_GEOIP_URL = string("xray_geoip_url", "https://github.com/Loyalsoldier/v2ray-rules-dat/raw/release/geoip.dat")
                @JvmField val XRAY_GEOSITE_URL = string("xray_geosite_url", "https://github.com/Loyalsoldier/v2ray-rules-dat/raw/release/geosite.dat")
           diff --git a/app/src/main/java/io/nekohasekai/sagernet/group/SubscriptionRefresh.kt b/app/src/main/java/io/nekohasekai/sagernet/group/SubscriptionRefresh.kt
-          index 33f2bd13..28daed3d 100644
+          index 33f2bd1..28daed3 100644
           --- a/app/src/main/java/io/nekohasekai/sagernet/group/SubscriptionRefresh.kt
           +++ b/app/src/main/java/io/nekohasekai/sagernet/group/SubscriptionRefresh.kt
           @@ -348,7 +348,7 @@ internal object SubscriptionRefresh {
@@ -205,7 +279,7 @@ jobs:
                /** The stored JSON of a type this build cannot parse is kept as is (re-exporting would drop its fields). */
                private fun contentKey(profile: ProxyEntity): String = SubscriptionReconcile.contentKey(
           diff --git a/app/src/main/java/io/nekohasekai/sagernet/outbound/import/ProfileImport.kt b/app/src/main/java/io/nekohasekai/sagernet/outbound/import/ProfileImport.kt
-          index 58ec581b..78bf7f14 100644
+          index 58ec581..78bf7f1 100644
           --- a/app/src/main/java/io/nekohasekai/sagernet/outbound/import/ProfileImport.kt
           +++ b/app/src/main/java/io/nekohasekai/sagernet/outbound/import/ProfileImport.kt
           @@ -64,13 +64,17 @@ object ProfileImport {
@@ -266,10 +340,10 @@ jobs:
                            if (!Validation.hasError(issues)) issues.add(parserError(vtr(R.string.validation_import_unparsed)))
           diff --git a/app/src/main/java/io/nekohasekai/sagernet/outbound/import/XrayFirst.kt b/app/src/main/java/io/nekohasekai/sagernet/outbound/import/XrayFirst.kt
           new file mode 100644
-          index 00000000..bedffe82
+          index 0000000..2676ff0
           --- /dev/null
           +++ b/app/src/main/java/io/nekohasekai/sagernet/outbound/import/XrayFirst.kt
-          @@ -0,0 +1,187 @@
+          @@ -0,0 +1,196 @@
           +package io.nekohasekai.sagernet.outbound.import
           +
           +import io.nekohasekai.sagernet.outbound.BuildContext
@@ -410,7 +484,8 @@ jobs:
           +                tls.client_certificate.isNotEmpty() || tls.client_certificate_path.isNotEmpty() ||
           +                tls.client_key.isNotEmpty() || tls.client_key_path.isNotEmpty()
           +            ) return null
-          +            if (tls.fragmentEffectivelyOn(ctx) || tls.record_fragment || tls.tls_tricks) return null
+          +            // The global defaults count too: a profile that inherits TLS tricks or fragment keeps them on sing-box.
+          +            if (tls.fragmentEffectivelyOn(ctx) || tls.record_fragment || tls.tlsTricksEffectivelyOn(ctx)) return null
           +            if (tls.min_version.isNotEmpty() || tls.max_version.isNotEmpty() || tls.curve_preferences.isNotEmpty()) return null
           +            if (tls.ech.enabled) return null
           +        }
@@ -419,6 +494,14 @@ jobs:
           +            !(type == "http" && !tls.enabled)
           +        ) return null
           +        if (transport.method.isNotEmpty() || transport.headers.isNotEmpty()) return null
+          +        // sing-box sends WebSocket early data in the URL path unless the header is Sec-WebSocket-Protocol, which is
+          +        // the only way Xray sends it: another header (or none) would not reach the server the same way.
+          +        if (type == "ws" && transport.max_early_data > 0 && !transport.path.contains("?ed=") &&
+          +            !transport.early_data_header_name.trim().equals("Sec-WebSocket-Protocol", ignoreCase = true)
+          +        ) return null
+          +        // gRPC keepalive (idle / ping timeout) has no field in the Xray profile: dropping it would let idle
+          +        // connections die silently on mobile networks, so such a profile stays on sing-box.
+          +        if (type == "grpc" && (transport.idle_timeout.isNotBlank() || transport.ping_timeout.isNotBlank())) return null
           +
           +        val query = ArrayList<Pair<String, String>>()
           +        query.addAll(transport.exportToLink(tls.enabled))
@@ -458,7 +541,7 @@ jobs:
           +    }
           +}
           diff --git a/app/src/main/java/io/nekohasekai/sagernet/ui/MainActivity.kt b/app/src/main/java/io/nekohasekai/sagernet/ui/MainActivity.kt
-          index 8d2c7969..cfb021d7 100644
+          index 8d2c796..cfb021d 100644
           --- a/app/src/main/java/io/nekohasekai/sagernet/ui/MainActivity.kt
           +++ b/app/src/main/java/io/nekohasekai/sagernet/ui/MainActivity.kt
           @@ -299,7 +299,7 @@ class MainActivity : ThemedActivity(),
@@ -471,7 +554,7 @@ jobs:
                        onMainDispatcher {
                            alert(e.readableMessage).show()
           diff --git a/app/src/main/java/io/nekohasekai/sagernet/ui/profile/ProfileTextImport.kt b/app/src/main/java/io/nekohasekai/sagernet/ui/profile/ProfileTextImport.kt
-          index 5203b59b..c5247060 100644
+          index 5203b59..c524706 100644
           --- a/app/src/main/java/io/nekohasekai/sagernet/ui/profile/ProfileTextImport.kt
           +++ b/app/src/main/java/io/nekohasekai/sagernet/ui/profile/ProfileTextImport.kt
           @@ -1,5 +1,6 @@
@@ -491,7 +574,7 @@ jobs:
                    return result.outbounds
                }
           diff --git a/app/src/main/java/io/nekohasekai/sagernet/ui/profiles/ProfileImports.kt b/app/src/main/java/io/nekohasekai/sagernet/ui/profiles/ProfileImports.kt
-          index f99a1309..cfc15ff8 100644
+          index f99a130..cfc15ff 100644
           --- a/app/src/main/java/io/nekohasekai/sagernet/ui/profiles/ProfileImports.kt
           +++ b/app/src/main/java/io/nekohasekai/sagernet/ui/profiles/ProfileImports.kt
           @@ -11,6 +11,7 @@ import androidx.activity.result.contract.ActivityResultContracts
@@ -512,7 +595,7 @@ jobs:
                                    report.addAll(result.reports)
                                    outbounds.addAll(result.outbounds)
           diff --git a/app/src/main/java/io/nekohasekai/sagernet/ui/profiles/ProfileListAdapter.kt b/app/src/main/java/io/nekohasekai/sagernet/ui/profiles/ProfileListAdapter.kt
-          index 97828f04..5e2ffac1 100644
+          index 97828f0..5e2ffac 100644
           --- a/app/src/main/java/io/nekohasekai/sagernet/ui/profiles/ProfileListAdapter.kt
           +++ b/app/src/main/java/io/nekohasekai/sagernet/ui/profiles/ProfileListAdapter.kt
           @@ -257,14 +257,23 @@ internal class ProfileListAdapter(private val fragment: ProfileListFragment) :
@@ -544,7 +627,7 @@ jobs:
            
                private fun refreshEntities(profileIds: List<Long>) {
           diff --git a/app/src/main/java/io/nekohasekai/sagernet/ui/profiles/ProfileRowHolder.kt b/app/src/main/java/io/nekohasekai/sagernet/ui/profiles/ProfileRowHolder.kt
-          index cd715e16..aa05364f 100644
+          index cd715e1..aa05364 100644
           --- a/app/src/main/java/io/nekohasekai/sagernet/ui/profiles/ProfileRowHolder.kt
           +++ b/app/src/main/java/io/nekohasekai/sagernet/ui/profiles/ProfileRowHolder.kt
           @@ -134,7 +134,10 @@ internal class RowContent(
@@ -569,7 +652,7 @@ jobs:
                        }
                        return items
           diff --git a/app/src/main/java/io/nekohasekai/sagernet/ui/test/TestSessionModel.kt b/app/src/main/java/io/nekohasekai/sagernet/ui/test/TestSessionModel.kt
-          index 64ffed0f..3973c276 100644
+          index 64ffed0..3973c27 100644
           --- a/app/src/main/java/io/nekohasekai/sagernet/ui/test/TestSessionModel.kt
           +++ b/app/src/main/java/io/nekohasekai/sagernet/ui/test/TestSessionModel.kt
           @@ -138,6 +138,19 @@ internal class TestSessionModel(
@@ -593,7 +676,7 @@ jobs:
                    val aborted = !ok && ProxyEntity.isTestAborted(error)
                    put(
           diff --git a/app/src/main/java/io/nekohasekai/sagernet/widget/StatsBar.kt b/app/src/main/java/io/nekohasekai/sagernet/widget/StatsBar.kt
-          index 4c7f309d..80f1cc55 100644
+          index 4c7f309..80f1cc5 100644
           --- a/app/src/main/java/io/nekohasekai/sagernet/widget/StatsBar.kt
           +++ b/app/src/main/java/io/nekohasekai/sagernet/widget/StatsBar.kt
           @@ -190,7 +190,7 @@ class StatsBar @JvmOverloads constructor(
@@ -619,7 +702,7 @@ jobs:
                    }
                    updateTooltip()
           diff --git a/app/src/main/res/layout/layout_stats_bar_content.xml b/app/src/main/res/layout/layout_stats_bar_content.xml
-          index a2d96657..79a9fde1 100644
+          index a2d9665..79a9fde 100644
           --- a/app/src/main/res/layout/layout_stats_bar_content.xml
           +++ b/app/src/main/res/layout/layout_stats_bar_content.xml
           @@ -49,7 +49,7 @@
@@ -632,7 +715,7 @@ jobs:
                        android:textSize="14sp"
                        android:visibility="gone"
           diff --git a/app/src/main/res/values-fa/strings.xml b/app/src/main/res/values-fa/strings.xml
-          index 78c63e33..431ee91b 100644
+          index 78c63e3..431ee91 100644
           --- a/app/src/main/res/values-fa/strings.xml
           +++ b/app/src/main/res/values-fa/strings.xml
           @@ -2384,4 +2384,8 @@
@@ -645,7 +728,7 @@ jobs:
           +    <string name="xray_for_all_sum">کانفیگ‌های VLESS، VMess، Trojan و Shadowsocks که از این به بعد وارد می‌شوند با هستهٔ Xray اجرا می‌شوند. Hysteria2، AnyTLS، TUIC، WireGuard و بقیهٔ پروتکل‌ها روی sing-box می‌مانند؛ همین‌طور کانفیگ‌هایی که گزینهٔ مخصوص sing-box دارند (گواهی ناامن، فرگمنت TLS، مالتی‌پلکس، پلاگین). کانفیگ‌های قبلی را دوباره وارد کنید یا ساب را آپدیت کنید.</string>
            </resources>
           diff --git a/app/src/main/res/values/strings.xml b/app/src/main/res/values/strings.xml
-          index f9bd29e8..c0e02eeb 100644
+          index f9bd29e..c0e02ee 100644
           --- a/app/src/main/res/values/strings.xml
           +++ b/app/src/main/res/values/strings.xml
           @@ -2581,4 +2581,8 @@
@@ -658,7 +741,7 @@ jobs:
           +    <string name="xray_for_all_sum">VLESS, VMess, Trojan and Shadowsocks imported from now on run in the Xray core. Hysteria2, AnyTLS, TUIC, WireGuard and the other protocols stay on sing-box, as do configs using a sing-box-only option (insecure certificate, TLS fragment, multiplex, plugin). Re-import existing configs or update the subscription.</string>
            </resources>
           diff --git a/app/src/main/res/xml/settings_core.xml b/app/src/main/res/xml/settings_core.xml
-          index 69208538..febb2b88 100644
+          index 6920853..febb2b8 100644
           --- a/app/src/main/res/xml/settings_core.xml
           +++ b/app/src/main/res/xml/settings_core.xml
           @@ -72,6 +72,11 @@
@@ -674,7 +757,7 @@ jobs:
                        app:fragment="io.nekohasekai.sagernet.ui.settings.XrayGeoSettingsFragment"
                        app:key="xrayGeoAssets"
           diff --git a/app/src/main/res/xml/settings_testing.xml b/app/src/main/res/xml/settings_testing.xml
-          index eeb66424..a9063d0b 100644
+          index eeb6642..a9063d0 100644
           --- a/app/src/main/res/xml/settings_testing.xml
           +++ b/app/src/main/res/xml/settings_testing.xml
           @@ -10,6 +10,11 @@
