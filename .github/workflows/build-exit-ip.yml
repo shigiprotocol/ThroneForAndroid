@@ -11,11 +11,11 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v7
-      - name: Exit IP after the ping test
+      - name: Exit IP after the ping test, configs on Xray
         run: |
           cat > "$RUNNER_TEMP/exit-ip.patch" <<'PATCH_EOF'
           diff --git a/app/src/main/java/io/nekohasekai/sagernet/bg/test/IpTestRunner.kt b/app/src/main/java/io/nekohasekai/sagernet/bg/test/IpTestRunner.kt
-          index 42ee125..645cd32 100644
+          index 42ee1250..645cd327 100644
           --- a/app/src/main/java/io/nekohasekai/sagernet/bg/test/IpTestRunner.kt
           +++ b/app/src/main/java/io/nekohasekai/sagernet/bg/test/IpTestRunner.kt
           @@ -5,8 +5,11 @@ import io.nekohasekai.sagernet.database.ProxyEntity
@@ -43,10 +43,24 @@ jobs:
                /** Not tested: the desktop only flags the latency in memory for an invalid candidate. */
                override fun invalid(profileId: Long, reason: String) = ProbeResult(profileId, error = reason, measured = false)
           diff --git a/app/src/main/java/io/nekohasekai/sagernet/bg/test/TestSession.kt b/app/src/main/java/io/nekohasekai/sagernet/bg/test/TestSession.kt
-          index 7864a3f..275bbdc 100644
+          index 7864a3ff..be272d50 100644
           --- a/app/src/main/java/io/nekohasekai/sagernet/bg/test/TestSession.kt
           +++ b/app/src/main/java/io/nekohasekai/sagernet/bg/test/TestSession.kt
-          @@ -175,13 +175,29 @@ internal class TestSession(
+          @@ -63,6 +63,13 @@ internal class TestSession(
+               @Volatile
+               private var client: ITestSessionCallback? = client
+           
+          +    /**
+          +     * Started from the UI (TestEngine.start). The background sweeps of [TestEngine.queueUrlTests] (auto-selector
+          +     * ranking at connect time, subscription follow-ups) have no client and skip the exit IP lookup, so they never wait
+          +     * on it: a connection through an auto selector starts as fast as before.
+          +     */
+          +    private val interactive: Boolean = client != null
+          +
+               @Volatile
+               var total = 0
+                   private set
+          @@ -175,13 +182,29 @@ internal class TestSession(
                        TestSpec.KIND_URL -> {
                            UrlTestRunner(this).run(profiles)
                            autoClearUnavailable(profiles)
@@ -67,7 +81,7 @@ jobs:
           +     * shown next to the latency (an IP test of just those, which keeps the latency and error already stored).
           +     */
           +    private suspend fun lookupExitIps(profiles: List<ProxyEntity>) {
-          +        if (cancelled || !DataStore.testLookupExitIp) return
+          +        if (cancelled || !interactive || !DataStore.testLookupExitIp) return
           +        val working = ProfileManager.getProfiles(profiles.map { it.id }).filter { it.isWorking() && it.latency > 0 }
           +        if (working.isEmpty()) return
           +        val byId = working.associateBy { it.id }
@@ -77,7 +91,7 @@ jobs:
                private suspend fun runCurrent() {
                    started(1)
                    val running = CoreRuntime.running
-          @@ -271,6 +287,18 @@ internal class TestSession(
+          @@ -271,6 +294,18 @@ internal class TestSession(
                    }
                }
            
@@ -97,7 +111,7 @@ jobs:
                 * The speed result loop of TestRunner.cpp:632-647 (the server's country name mapped to its code); the callback
                 * carries the values as stored.
           diff --git a/app/src/main/java/io/nekohasekai/sagernet/database/DataStore.kt b/app/src/main/java/io/nekohasekai/sagernet/database/DataStore.kt
-          index d3e69d4..45b24f1 100644
+          index d3e69d46..e279ec9f 100644
           --- a/app/src/main/java/io/nekohasekai/sagernet/database/DataStore.kt
           +++ b/app/src/main/java/io/nekohasekai/sagernet/database/DataStore.kt
           @@ -244,6 +244,7 @@ object DataStore : OnPreferenceDataStoreChangeListener {
@@ -108,8 +122,16 @@ jobs:
                var exitCountryLookup by SettingsRegistry.EXIT_COUNTRY_LOOKUP
                var exitLookupProvider by SettingsRegistry.EXIT_LOOKUP_PROVIDER
                var speedTestMode by SettingsRegistry.SPEED_TEST_MODE
+          @@ -301,6 +302,7 @@ object DataStore : OnPreferenceDataStoreChangeListener {
+               var coreBoxApiPort by SettingsRegistry.CORE_BOX_API_PORT
+               var coreDnsInPort by SettingsRegistry.CORE_DNS_IN_PORT
+               var xrayVlessPreference by SettingsRegistry.XRAY_VLESS_PREFERENCE
+          +    var xrayForAll by SettingsRegistry.XRAY_FOR_ALL
+               var xrayGeoipUrl by SettingsRegistry.XRAY_GEOIP_URL
+               var xrayGeositeUrl by SettingsRegistry.XRAY_GEOSITE_URL
+               var skipCert by SettingsRegistry.SKIP_CERT
           diff --git a/app/src/main/java/io/nekohasekai/sagernet/database/ProfileManager.kt b/app/src/main/java/io/nekohasekai/sagernet/database/ProfileManager.kt
-          index b1119cc..271a919 100644
+          index b1119cc2..271a919b 100644
           --- a/app/src/main/java/io/nekohasekai/sagernet/database/ProfileManager.kt
           +++ b/app/src/main/java/io/nekohasekai/sagernet/database/ProfileManager.kt
           @@ -355,6 +355,14 @@ object ProfileManager {
@@ -128,17 +150,10 @@ jobs:
                fun saveSpeedTestResult(
                    profileId: Long,
           diff --git a/app/src/main/java/io/nekohasekai/sagernet/database/ProxyEntity.kt b/app/src/main/java/io/nekohasekai/sagernet/database/ProxyEntity.kt
-          index b70838b..2000af0 100644
+          index b70838b9..6194bbdf 100644
           --- a/app/src/main/java/io/nekohasekai/sagernet/database/ProxyEntity.kt
           +++ b/app/src/main/java/io/nekohasekai/sagernet/database/ProxyEntity.kt
-          @@ -169,10 +169,22 @@ data class ProxyEntity(
-                       else -> {
-                           recordLatency(-1)
-                           testError = error
-          +                // A dead server keeps no stale flag / exit IP from an earlier test.
-          +                testCountry = null
-          +                ipOut = null
-                       }
+          @@ -173,6 +173,15 @@ data class ProxyEntity(
                    }
                }
            
@@ -155,7 +170,7 @@ jobs:
                fun applyIpResult(ip: String, country: String, error: String) {
                    if (error.isEmpty()) {
           diff --git a/app/src/main/java/io/nekohasekai/sagernet/database/SettingsRegistry.kt b/app/src/main/java/io/nekohasekai/sagernet/database/SettingsRegistry.kt
-          index 8d44ff2..5710cb3 100644
+          index 8d44ff29..1eb6ee01 100644
           --- a/app/src/main/java/io/nekohasekai/sagernet/database/SettingsRegistry.kt
           +++ b/app/src/main/java/io/nekohasekai/sagernet/database/SettingsRegistry.kt
           @@ -251,6 +251,8 @@ object SettingsRegistry {
@@ -167,8 +182,337 @@ jobs:
                /** The exit country of the running connection (widget/ExitIp.kt); off never asks a lookup service on its own. */
                @JvmField val EXIT_COUNTRY_LOOKUP = bool("exit_country_lookup", true)
                /** "auto" or one service id of ExitIp; an id this build does not know (a newer desktop's) runs as "auto". */
+          @@ -334,6 +336,8 @@ object SettingsRegistry {
+               @JvmField val CORE_DNS_IN_PORT = int("core_dns_in_port", 5533, SettingValidators::isPort)
+               /** 0 XHTTP only, 1 XHTTP and Reality, 2 all VLESS (Const.hpp:70-75). */
+               @JvmField val XRAY_VLESS_PREFERENCE = int("xray_vless_preference", 1) { it in 0..2 }
+          +    /** ShigiProtocol: VLESS, VMess, Trojan and Shadowsocks are imported as Xray profiles (XrayFirst). */
+          +    @JvmField val XRAY_FOR_ALL = bool("xray_for_all", true)
+               /** Where geoip.dat / geosite.dat come from when an Xray config needs them (SettingsRepo.h:305-307). */
+               @JvmField val XRAY_GEOIP_URL = string("xray_geoip_url", "https://github.com/Loyalsoldier/v2ray-rules-dat/raw/release/geoip.dat")
+               @JvmField val XRAY_GEOSITE_URL = string("xray_geosite_url", "https://github.com/Loyalsoldier/v2ray-rules-dat/raw/release/geosite.dat")
+          diff --git a/app/src/main/java/io/nekohasekai/sagernet/group/SubscriptionRefresh.kt b/app/src/main/java/io/nekohasekai/sagernet/group/SubscriptionRefresh.kt
+          index 33f2bd13..28daed3d 100644
+          --- a/app/src/main/java/io/nekohasekai/sagernet/group/SubscriptionRefresh.kt
+          +++ b/app/src/main/java/io/nekohasekai/sagernet/group/SubscriptionRefresh.kt
+          @@ -348,7 +348,7 @@ internal object SubscriptionRefresh {
+               }
+           
+               private fun parse(body: String): ProfileImport.Result =
+          -        ProfileImport.parse(body, SettingsMapper.xrayVlessPreference(), SettingsMapper.buildContext())
+          +        ProfileImport.parse(body, SettingsMapper.xrayVlessPreference(), SettingsMapper.buildContext(), DataStore.xrayForAll)
+           
+               /** The stored JSON of a type this build cannot parse is kept as is (re-exporting would drop its fields). */
+               private fun contentKey(profile: ProxyEntity): String = SubscriptionReconcile.contentKey(
+          diff --git a/app/src/main/java/io/nekohasekai/sagernet/outbound/import/ProfileImport.kt b/app/src/main/java/io/nekohasekai/sagernet/outbound/import/ProfileImport.kt
+          index 58ec581b..78bf7f14 100644
+          --- a/app/src/main/java/io/nekohasekai/sagernet/outbound/import/ProfileImport.kt
+          +++ b/app/src/main/java/io/nekohasekai/sagernet/outbound/import/ProfileImport.kt
+          @@ -64,13 +64,17 @@ object ProfileImport {
+               /** The size cap of a compressed vpn:// payload (SubscriptionParser.cpp). */
+               private const val MAX_VPN_PAYLOAD = 16L * 1024 * 1024
+           
+          -    /** [ctx] carries the global settings validate reads (SettingsMapper.buildContext()). */
+          +    /**
+          +     * [ctx] carries the global settings validate reads (SettingsMapper.buildContext()); with [xrayForAll] a VLESS,
+          +     * VMess, Trojan or Shadowsocks profile that Xray can carry is imported as an Xray profile ([XrayFirst]).
+          +     */
+               @JvmStatic
+               @JvmOverloads
+               fun parse(
+                   text: String,
+                   preference: OutboundFactory.XrayVlessPreference = OutboundFactory.DEFAULT_XRAY_VLESS_PREFERENCE,
+                   ctx: BuildContext = BuildContext.DEFAULT,
+          +        xrayForAll: Boolean = false,
+               ): Result {
+                   var body = Scan.trim(text)
+                   if (body.isEmpty()) return Result(emptyList(), emptyList())
+          @@ -81,7 +85,7 @@ object ProfileImport {
+                   } else if (Scan.looksLikeUrlSafeBase64(body)) {
+                       Scan.decodeBase64UrlSafe(body)?.let { body = it }
+                   }
+          -        val parser = Parser(preference, ctx)
+          +        val parser = Parser(preference, ctx, xrayForAll)
+                   parser.document(body, allowBase64 = false, needParse = true, depth = 0)
+                   return Result(parser.produced, parser.reports)
+               }
+          @@ -326,7 +330,11 @@ object ProfileImport {
+                       differs(reality, "mldsa65Verify", s.reality.mldsa65Verify)
+               }
+           
+          -    private class Parser(private val preference: OutboundFactory.XrayVlessPreference, private val ctx: BuildContext) {
+          +    private class Parser(
+          +        private val preference: OutboundFactory.XrayVlessPreference,
+          +        private val ctx: BuildContext,
+          +        private val xrayForAll: Boolean = false,
+          +    ) {
+                   val produced = ArrayList<Outbound>()
+                   val reports = ArrayList<ParseReport>()
+           
+          @@ -345,7 +353,13 @@ object ProfileImport {
+                    * Parser::accept: the import checks after a parse; an Error refuses the profile, warnings travel with it.
+                    * Android also refuses what the core it would run in cannot run (#63, [CoreSupport]).
+                    */
+          -        private fun accept(outbound: Outbound?, parsed: Boolean, issues: MutableList<Issue>, source: () -> String) {
+          +        private fun accept(parsedOutbound: Outbound?, parsed: Boolean, issues: MutableList<Issue>, source: () -> String) {
+          +            var outbound = parsedOutbound
+          +            // xray_for_all: what Xray can carry the same way runs there; the parse's own issues still decide.
+          +            if (xrayForAll && parsed && outbound != null && !Validation.hasError(issues)) {
+          +                val converted = XrayFirst.convert(outbound, ctx)
+          +                if (converted != null) outbound = converted
+          +            }
+                       var imported = false
+                       if (outbound == null || !parsed) {
+                           if (!Validation.hasError(issues)) issues.add(parserError(vtr(R.string.validation_import_unparsed)))
+          diff --git a/app/src/main/java/io/nekohasekai/sagernet/outbound/import/XrayFirst.kt b/app/src/main/java/io/nekohasekai/sagernet/outbound/import/XrayFirst.kt
+          new file mode 100644
+          index 00000000..bedffe82
+          --- /dev/null
+          +++ b/app/src/main/java/io/nekohasekai/sagernet/outbound/import/XrayFirst.kt
+          @@ -0,0 +1,187 @@
+          +package io.nekohasekai.sagernet.outbound.import
+          +
+          +import io.nekohasekai.sagernet.outbound.BuildContext
+          +import io.nekohasekai.sagernet.outbound.Outbound
+          +import io.nekohasekai.sagernet.outbound.common.Tls
+          +import io.nekohasekai.sagernet.outbound.common.Transport
+          +import io.nekohasekai.sagernet.outbound.common.XrayStreamSetting
+          +import io.nekohasekai.sagernet.outbound.common.xrayNetworks
+          +import io.nekohasekai.sagernet.outbound.json.JsonArray
+          +import io.nekohasekai.sagernet.outbound.json.JsonObject
+          +import io.nekohasekai.sagernet.outbound.link.LinkBuilder
+          +import io.nekohasekai.sagernet.outbound.link.LinkParser
+          +import io.nekohasekai.sagernet.outbound.types.Custom
+          +import io.nekohasekai.sagernet.outbound.types.Shadowsocks
+          +import io.nekohasekai.sagernet.outbound.types.Trojan
+          +import io.nekohasekai.sagernet.outbound.types.Vless
+          +import io.nekohasekai.sagernet.outbound.types.Vmess
+          +import io.nekohasekai.sagernet.validation.Issue
+          +import io.nekohasekai.sagernet.validation.ParseDiag
+          +import io.nekohasekai.sagernet.validation.Validation
+          +
+          +/**
+          + * ShigiProtocol: with `xray_for_all` on, an imported VLESS, VMess, Trojan or Shadowsocks profile runs in the Xray core
+          + * (as the Xray outbound an Xray JSON import would give: VLESS becomes an xrayvless profile, the others a custom Xray
+          + * outbound). Every other protocol (Hysteria2, AnyTLS, TUIC, WireGuard, ...) has no Xray client and stays on sing-box.
+          + *
+          + * Only what Xray can carry the same way moves: a profile using a sing-box-only feature (an insecure or custom
+          + * certificate, TLS fragment / tricks, sing-box multiplex, a transport Xray lacks such as h2 or QUIC, a legacy cipher,
+          + * a SIP003 plugin, VMess alterId) stays on sing-box rather than connecting differently.
+          + */
+          +internal object XrayFirst {
+          +
+          +    /** The Shadowsocks methods Xray accepts (infra/conf/shadowsocks.go), mapped to the names it documents. */
+          +    private val SS_METHODS = mapOf(
+          +        "aes-128-gcm" to "aes-128-gcm",
+          +        "aes-256-gcm" to "aes-256-gcm",
+          +        "chacha20-poly1305" to "chacha20-poly1305",
+          +        "chacha20-ietf-poly1305" to "chacha20-poly1305",
+          +        "xchacha20-poly1305" to "xchacha20-poly1305",
+          +        "xchacha20-ietf-poly1305" to "xchacha20-poly1305",
+          +        "2022-blake3-aes-128-gcm" to "2022-blake3-aes-128-gcm",
+          +        "2022-blake3-aes-256-gcm" to "2022-blake3-aes-256-gcm",
+          +        "2022-blake3-chacha20-poly1305" to "2022-blake3-chacha20-poly1305",
+          +        "none" to "none",
+          +        "plain" to "none",
+          +    )
+          +
+          +    /** The VMess ciphers Xray accepts (infra/conf/vmess.go). */
+          +    private val VMESS_SECURITY = setOf("auto", "aes-128-gcm", "chacha20-poly1305", "none", "zero")
+          +
+          +    /**
+          +     * The Xray profile for [outbound], or null when it stays as it is. [ctx] gives the global defaults (TLS fragment)
+          +     * a profile may inherit. Only a profile that already passes its own sing-box checks is converted.
+          +     */
+          +    fun convert(outbound: Outbound, ctx: BuildContext): Outbound? {
+          +        if (outbound !is Shadowsocks && outbound !is Vmess && outbound !is Trojan && outbound !is Vless) return null
+          +        if (outbound.server.isBlank() || outbound.serverPort !in 1..65535) return null
+          +        val checks = ArrayList<Issue>()
+          +        try {
+          +            outbound.validate(checks, ctx)
+          +        } catch (e: RuntimeException) {
+          +            return null
+          +        }
+          +        if (Validation.hasError(checks)) return null
+          +        val json = try {
+          +            when (outbound) {
+          +                is Shadowsocks -> shadowsocks(outbound, ctx)
+          +                is Vmess -> vmess(outbound, ctx)
+          +                is Trojan -> trojan(outbound, ctx)
+          +                is Vless -> vless(outbound, ctx)
+          +                else -> null
+          +            }
+          +        } catch (e: RuntimeException) {
+          +            null
+          +        } ?: return null
+          +        if (outbound.name.isNotEmpty()) json["tag"] = outbound.name
+          +        val converted = Custom.fromXrayOutbound(json) ?: return null
+          +        if (converted.name.isEmpty()) converted.name = outbound.name.ifEmpty { "${outbound.server}:${outbound.serverPort}" }
+          +        // The importer's own Xray check ([CoreSupport]) must pass too, or the sing-box profile is kept.
+          +        if (CoreSupport.problem(converted) != null) return null
+          +        return converted
+          +    }
+          +
+          +    private fun shadowsocks(ss: Shadowsocks, ctx: BuildContext): JsonObject? {
+          +        if (ss.plugin.isNotBlank() || ss.multiplex.effectivelyOn(ctx)) return null
+          +        val method = SS_METHODS[ss.method.trim().lowercase()] ?: return null
+          +        val server = peer(ss)
+          +        server["method"] = method
+          +        server["password"] = ss.password
+          +        if (ss.uot) {
+          +            // sing-box's udp_over_tcp defaults to version 2, which Xray must be told explicitly.
+          +            server["uot"] = true
+          +            server["UoTVersion"] = 2
+          +        }
+          +        return outbound("shadowsocks", "servers", server, null)
+          +    }
+          +
+          +    private fun vmess(vm: Vmess, ctx: BuildContext): JsonObject? {
+          +        if (vm.multiplex.effectivelyOn(ctx) || vm.alter_id != 0 || vm.authenticated_length || vm.global_padding) return null
+          +        val security = vm.security.trim().lowercase().ifEmpty { "auto" }
+          +        if (security !in VMESS_SECURITY) return null
+          +        val stream = stream(vm.transport, vm.tls, ctx) ?: return null
+          +        val user = JsonObject()
+          +        user["id"] = vm.uuid
+          +        user["security"] = security
+          +        return outbound("vmess", "vnext", peer(vm).also { it["users"] = JsonArray().add(user) }, stream)
+          +    }
+          +
+          +    private fun trojan(tr: Trojan, ctx: BuildContext): JsonObject? {
+          +        if (tr.multiplex.effectivelyOn(ctx)) return null
+          +        val stream = stream(tr.transport, tr.tls, ctx) ?: return null
+          +        val server = peer(tr)
+          +        server["password"] = tr.password
+          +        return outbound("trojan", "servers", server, stream)
+          +    }
+          +
+          +    private fun vless(vl: Vless, ctx: BuildContext): JsonObject? {
+          +        if (vl.multiplex.effectivelyOn(ctx)) return null
+          +        val flow = vl.flow.trim().lowercase()
+          +        if (flow.isNotEmpty() && flow != "none" && flow != "xtls-rprx-vision") return null
+          +        val stream = stream(vl.transport, vl.tls, ctx) ?: return null
+          +        val user = JsonObject()
+          +        user["id"] = vl.uuid
+          +        user["encryption"] = "none"
+          +        if (flow == "xtls-rprx-vision") user["flow"] = flow
+          +        return outbound("vless", "vnext", peer(vl).also { it["users"] = JsonArray().add(user) }, stream)
+          +    }
+          +
+          +    /**
+          +     * The Xray streamSettings of a sing-box transport and TLS: both go out as share-link query items, which the Xray
+          +     * stream reads back exactly as for an imported link. Null for what Xray cannot carry the same way.
+          +     */
+          +    private fun stream(transport: Transport, tls: Tls, ctx: BuildContext): JsonObject? {
+          +        if (tls.enabled) {
+          +            if (tls.insecure || ctx.skipCert || tls.disable_sni) return null
+          +            if (tls.certificate.isNotEmpty() || tls.certificate_path.isNotEmpty() ||
+          +                tls.certificate_public_key_sha256.isNotEmpty() ||
+          +                tls.client_certificate.isNotEmpty() || tls.client_certificate_path.isNotEmpty() ||
+          +                tls.client_key.isNotEmpty() || tls.client_key_path.isNotEmpty()
+          +            ) return null
+          +            if (tls.fragmentEffectivelyOn(ctx) || tls.record_fragment || tls.tls_tricks) return null
+          +            if (tls.min_version.isNotEmpty() || tls.max_version.isNotEmpty() || tls.curve_preferences.isNotEmpty()) return null
+          +            if (tls.ech.enabled) return null
+          +        }
+          +        val type = transport.type.trim().lowercase()
+          +        if (type.isNotEmpty() && type != "tcp" && type != "ws" && type != "grpc" && type != "httpupgrade" &&
+          +            !(type == "http" && !tls.enabled)
+          +        ) return null
+          +        if (transport.method.isNotEmpty() || transport.headers.isNotEmpty()) return null
+          +
+          +        val query = ArrayList<Pair<String, String>>()
+          +        query.addAll(transport.exportToLink(tls.enabled))
+          +        if (type == "ws" && transport.max_early_data > 0 && !transport.path.contains("?ed=")) {
+          +            query.add("ed" to transport.max_early_data.toString())
+          +        }
+          +        if (tls.enabled) query.addAll(tls.exportToLink()) else query.add("security" to "none")
+          +        val link = LinkBuilder("vless").setUserName("x")
+          +        link.host = "example.com"
+          +        link.port = 443
+          +        link.addQueryItems(query)
+          +
+          +        val stream = XrayStreamSetting()
+          +        val issues = ArrayList<Issue>()
+          +        val parsed = ParseDiag.scoped(issues) { stream.parseFromLink(LinkParser.parse(link.build())) }
+          +        if (!parsed || Validation.hasError(issues) || stream.network !in xrayNetworks) return null
+          +        val expected = if (!tls.enabled) "none" else if (tls.reality.enabled) "reality" else "tls"
+          +        if (stream.security != expected) return null
+          +        return stream.exportToJson()
+          +    }
+          +
+          +    private fun peer(outbound: Outbound): JsonObject {
+          +        val server = JsonObject()
+          +        server["address"] = outbound.server
+          +        server["port"] = outbound.serverPort
+          +        return server
+          +    }
+          +
+          +    private fun outbound(protocol: String, list: String, peer: JsonObject, stream: JsonObject?): JsonObject {
+          +        val settings = JsonObject()
+          +        settings[list] = JsonArray().add(peer)
+          +        val out = JsonObject()
+          +        out["protocol"] = protocol
+          +        out["settings"] = settings
+          +        if (stream != null) out["streamSettings"] = stream
+          +        return out
+          +    }
+          +}
+          diff --git a/app/src/main/java/io/nekohasekai/sagernet/ui/MainActivity.kt b/app/src/main/java/io/nekohasekai/sagernet/ui/MainActivity.kt
+          index 8d2c7969..cfb021d7 100644
+          --- a/app/src/main/java/io/nekohasekai/sagernet/ui/MainActivity.kt
+          +++ b/app/src/main/java/io/nekohasekai/sagernet/ui/MainActivity.kt
+          @@ -299,7 +299,7 @@ class MainActivity : ThemedActivity(),
+               suspend fun importProfile(uri: Uri) {
+                   val link = uri.toString()
+                   val result = try {
+          -            ProfileImport.parse(link, SettingsMapper.xrayVlessPreference(), SettingsMapper.buildContext())
+          +            ProfileImport.parse(link, SettingsMapper.xrayVlessPreference(), SettingsMapper.buildContext(), DataStore.xrayForAll)
+                   } catch (e: Exception) {
+                       onMainDispatcher {
+                           alert(e.readableMessage).show()
+          diff --git a/app/src/main/java/io/nekohasekai/sagernet/ui/profile/ProfileTextImport.kt b/app/src/main/java/io/nekohasekai/sagernet/ui/profile/ProfileTextImport.kt
+          index 5203b59b..c5247060 100644
+          --- a/app/src/main/java/io/nekohasekai/sagernet/ui/profile/ProfileTextImport.kt
+          +++ b/app/src/main/java/io/nekohasekai/sagernet/ui/profile/ProfileTextImport.kt
+          @@ -1,5 +1,6 @@
+           package io.nekohasekai.sagernet.ui.profile
+           
+          +import io.nekohasekai.sagernet.database.DataStore
+           import io.nekohasekai.sagernet.database.SettingsMapper
+           import io.nekohasekai.sagernet.ktx.Logs
+           import io.nekohasekai.sagernet.outbound.Outbound
+          @@ -13,7 +14,7 @@ object ProfileTextImport {
+           
+               /** Every outbound found in [text] that passed the import checks; the parse report (refused items, warnings) goes to the log. */
+               fun parse(text: String): List<Outbound> {
+          -        val result = ProfileImport.parse(text, SettingsMapper.xrayVlessPreference(), SettingsMapper.buildContext())
+          +        val result = ProfileImport.parse(text, SettingsMapper.xrayVlessPreference(), SettingsMapper.buildContext(), DataStore.xrayForAll)
+                   for (message in result.messages) Logs.w(message)
+                   return result.outbounds
+               }
+          diff --git a/app/src/main/java/io/nekohasekai/sagernet/ui/profiles/ProfileImports.kt b/app/src/main/java/io/nekohasekai/sagernet/ui/profiles/ProfileImports.kt
+          index f99a1309..cfc15ff8 100644
+          --- a/app/src/main/java/io/nekohasekai/sagernet/ui/profiles/ProfileImports.kt
+          +++ b/app/src/main/java/io/nekohasekai/sagernet/ui/profiles/ProfileImports.kt
+          @@ -11,6 +11,7 @@ import androidx.activity.result.contract.ActivityResultContracts
+           import io.nekohasekai.sagernet.R
+           import io.nekohasekai.sagernet.SagerNet
+           import io.nekohasekai.sagernet.database.ProfileManager
+          +import io.nekohasekai.sagernet.database.DataStore
+           import io.nekohasekai.sagernet.database.SettingsMapper
+           import io.nekohasekai.sagernet.ktx.Logs
+           import io.nekohasekai.sagernet.ktx.readableMessage
+          @@ -110,7 +111,7 @@ class ProfileImports(private val host: ConfigurationFragment) {
+                               while (true) {
+                                   val entry = zip.nextEntry ?: break
+                                   if (entry.isDirectory) continue
+          -                        val result = ProfileImport.parse(zip.bufferedReader().readText(), preference, ctx)
+          +                        val result = ProfileImport.parse(zip.bufferedReader().readText(), preference, ctx, DataStore.xrayForAll)
+                                   for (message in result.messages) Logs.w(message)
+                                   report.addAll(result.reports)
+                                   outbounds.addAll(result.outbounds)
           diff --git a/app/src/main/java/io/nekohasekai/sagernet/ui/profiles/ProfileListAdapter.kt b/app/src/main/java/io/nekohasekai/sagernet/ui/profiles/ProfileListAdapter.kt
-          index 97828f0..5e2ffac 100644
+          index 97828f04..5e2ffac1 100644
           --- a/app/src/main/java/io/nekohasekai/sagernet/ui/profiles/ProfileListAdapter.kt
           +++ b/app/src/main/java/io/nekohasekai/sagernet/ui/profiles/ProfileListAdapter.kt
           @@ -257,14 +257,23 @@ internal class ProfileListAdapter(private val fragment: ProfileListFragment) :
@@ -199,8 +543,33 @@ jobs:
                }
            
                private fun refreshEntities(profileIds: List<Long>) {
+          diff --git a/app/src/main/java/io/nekohasekai/sagernet/ui/profiles/ProfileRowHolder.kt b/app/src/main/java/io/nekohasekai/sagernet/ui/profiles/ProfileRowHolder.kt
+          index cd715e16..aa05364f 100644
+          --- a/app/src/main/java/io/nekohasekai/sagernet/ui/profiles/ProfileRowHolder.kt
+          +++ b/app/src/main/java/io/nekohasekai/sagernet/ui/profiles/ProfileRowHolder.kt
+          @@ -134,7 +134,10 @@ internal class RowContent(
+                       val items = ArrayList<Item>()
+                       val head = ArrayList<String>()
+                       val headSpoken = ArrayList<String>()
+          -            profile.testCountry?.takeIf { it.isNotEmpty() }?.let { country ->
+          +            // A failed profile shows no flag / exit IP from an earlier test. They stay stored: an auto selector's
+          +            // country filter reads them, and one failed test must not drop a server from its pool.
+          +            val failed = latency < 0
+          +            profile.testCountry?.takeIf { it.isNotEmpty() && !failed }?.let { country ->
+                           val code = country.length == 2 && country.all { it in 'A'..'Z' || it in 'a'..'z' }
+                           head += if (code) ProxyEntity.countryFlag(country) else country
+                           headSpoken += if (code) countryName(country) else country
+          @@ -146,7 +149,7 @@ internal class RowContent(
+                       if (head.isNotEmpty()) items += Item(head.joinToString(NBSP), color, headSpoken.joinToString(", "))
+                       if (show.showSpeed) speeds(context, profile.dlSpeed, profile.ulSpeed, secondary)?.let { items += it }
+                       val ip = profile.ipOut.orEmpty()
+          -            if (show.showIp && ip.isNotEmpty()) {
+          +            if (show.showIp && ip.isNotEmpty() && !failed) {
+                           items += Item("🌐$NBSP$ip", secondary, context.getString(R.string.profile_row_ip, ip))
+                       }
+                       return items
           diff --git a/app/src/main/java/io/nekohasekai/sagernet/ui/test/TestSessionModel.kt b/app/src/main/java/io/nekohasekai/sagernet/ui/test/TestSessionModel.kt
-          index 64ffed0..3973c27 100644
+          index 64ffed0f..3973c276 100644
           --- a/app/src/main/java/io/nekohasekai/sagernet/ui/test/TestSessionModel.kt
           +++ b/app/src/main/java/io/nekohasekai/sagernet/ui/test/TestSessionModel.kt
           @@ -138,6 +138,19 @@ internal class TestSessionModel(
@@ -224,7 +593,7 @@ jobs:
                    val aborted = !ok && ProxyEntity.isTestAborted(error)
                    put(
           diff --git a/app/src/main/java/io/nekohasekai/sagernet/widget/StatsBar.kt b/app/src/main/java/io/nekohasekai/sagernet/widget/StatsBar.kt
-          index 4c7f309..80f1cc5 100644
+          index 4c7f309d..80f1cc55 100644
           --- a/app/src/main/java/io/nekohasekai/sagernet/widget/StatsBar.kt
           +++ b/app/src/main/java/io/nekohasekai/sagernet/widget/StatsBar.kt
           @@ -190,7 +190,7 @@ class StatsBar @JvmOverloads constructor(
@@ -250,7 +619,7 @@ jobs:
                    }
                    updateTooltip()
           diff --git a/app/src/main/res/layout/layout_stats_bar_content.xml b/app/src/main/res/layout/layout_stats_bar_content.xml
-          index a2d9665..79a9fde 100644
+          index a2d96657..79a9fde1 100644
           --- a/app/src/main/res/layout/layout_stats_bar_content.xml
           +++ b/app/src/main/res/layout/layout_stats_bar_content.xml
           @@ -49,7 +49,7 @@
@@ -263,29 +632,49 @@ jobs:
                        android:textSize="14sp"
                        android:visibility="gone"
           diff --git a/app/src/main/res/values-fa/strings.xml b/app/src/main/res/values-fa/strings.xml
-          index 78c63e3..4273a10 100644
+          index 78c63e33..431ee91b 100644
           --- a/app/src/main/res/values-fa/strings.xml
           +++ b/app/src/main/res/values-fa/strings.xml
-          @@ -2384,4 +2384,6 @@
+          @@ -2384,4 +2384,8 @@
                <string name="validation_route_dns_dropped">تنظیمات DNS اختصاصی پروفایل کنار گذاشته شد، بنابراین از تنظیمات سراسری استفاده می‌کند: %1$s</string>
                <string name="route_dns_global_servers">ریموت %1$s، مستقیم %2$s</string>
                <string name="dns_server_suggestions">سرورهای اخیر و پیشنهادی</string>
           +    <string name="test_lookup_exit_ip">نمایش IP خروجی بعد از تست پینگ</string>
           +    <string name="test_lookup_exit_ip_sum">بعد از تست URL (یا تست سرعت در حالت کشور)، از طریق هر پروفایل سالم IP و کشور خروجی را از یک سرویس IP می‌پرسد و کنار پینگ نشان می‌دهد.</string>
+          +    <string name="xray_for_all">اجرای کانفیگ‌ها با Xray</string>
+          +    <string name="xray_for_all_sum">کانفیگ‌های VLESS، VMess، Trojan و Shadowsocks که از این به بعد وارد می‌شوند با هستهٔ Xray اجرا می‌شوند. Hysteria2، AnyTLS، TUIC، WireGuard و بقیهٔ پروتکل‌ها روی sing-box می‌مانند؛ همین‌طور کانفیگ‌هایی که گزینهٔ مخصوص sing-box دارند (گواهی ناامن، فرگمنت TLS، مالتی‌پلکس، پلاگین). کانفیگ‌های قبلی را دوباره وارد کنید یا ساب را آپدیت کنید.</string>
            </resources>
           diff --git a/app/src/main/res/values/strings.xml b/app/src/main/res/values/strings.xml
-          index f9bd29e..908f142 100644
+          index f9bd29e8..c0e02eeb 100644
           --- a/app/src/main/res/values/strings.xml
           +++ b/app/src/main/res/values/strings.xml
-          @@ -2581,4 +2581,6 @@
+          @@ -2581,4 +2581,8 @@
                <string name="validation_route_dns_dropped">The profile\'s own DNS settings were dropped, so it uses the global ones: %1$s</string>
                <string name="route_dns_global_servers">Remote %1$s, direct %2$s</string>
                <string name="dns_server_suggestions">Recent and suggested servers</string>
           +    <string name="test_lookup_exit_ip">Show exit IP after URL test</string>
           +    <string name="test_lookup_exit_ip_sum">After a URL test (or a country-mode speed test), ask an IP lookup service through each working profile for its exit IP and country, and show them next to the latency.</string>
+          +    <string name="xray_for_all">Run configs on Xray</string>
+          +    <string name="xray_for_all_sum">VLESS, VMess, Trojan and Shadowsocks imported from now on run in the Xray core. Hysteria2, AnyTLS, TUIC, WireGuard and the other protocols stay on sing-box, as do configs using a sing-box-only option (insecure certificate, TLS fragment, multiplex, plugin). Re-import existing configs or update the subscription.</string>
            </resources>
+          diff --git a/app/src/main/res/xml/settings_core.xml b/app/src/main/res/xml/settings_core.xml
+          index 69208538..febb2b88 100644
+          --- a/app/src/main/res/xml/settings_core.xml
+          +++ b/app/src/main/res/xml/settings_core.xml
+          @@ -72,6 +72,11 @@
+                       app:key="xray_vless_preference"
+                       app:title="@string/xray_vless_preference"
+                       app:useSimpleSummaryProvider="true" />
+          +        <SwitchPreference
+          +            app:defaultValue="true"
+          +            app:key="xray_for_all"
+          +            app:summary="@string/xray_for_all_sum"
+          +            app:title="@string/xray_for_all" />
+                   <Preference
+                       app:fragment="io.nekohasekai.sagernet.ui.settings.XrayGeoSettingsFragment"
+                       app:key="xrayGeoAssets"
           diff --git a/app/src/main/res/xml/settings_testing.xml b/app/src/main/res/xml/settings_testing.xml
-          index eeb6642..a9063d0 100644
+          index eeb66424..a9063d0b 100644
           --- a/app/src/main/res/xml/settings_testing.xml
           +++ b/app/src/main/res/xml/settings_testing.xml
           @@ -10,6 +10,11 @@
@@ -352,6 +741,11 @@ jobs:
           # Also a universal APK (every ABI in one file) next to the per-ABI ones.
           sed -i 's/isUniversalApk = false/isUniversalApk = true/' buildSrc/src/main/kotlin/Helpers.kt
           grep -q 'isUniversalApk = true' buildSrc/src/main/kotlin/Helpers.kt
+          # Every vless:// link (3x-ui) runs in the Xray core by default; still changeable under Settings > Core > Xray.
+          sed -i 's/XRAY_VLESS_PREFERENCE = int("xray_vless_preference", 1)/XRAY_VLESS_PREFERENCE = int("xray_vless_preference", 2)/' app/src/main/java/io/nekohasekai/sagernet/database/SettingsRegistry.kt
+          grep -q 'int("xray_vless_preference", 2)' app/src/main/java/io/nekohasekai/sagernet/database/SettingsRegistry.kt
+          sed -i 's/DEFAULT_XRAY_VLESS_PREFERENCE: XrayVlessPreference = XrayVlessPreference.XhttpAndReality/DEFAULT_XRAY_VLESS_PREFERENCE: XrayVlessPreference = XrayVlessPreference.AllVLESS/' app/src/main/java/io/nekohasekai/sagernet/outbound/OutboundFactory.kt
+          grep -q 'DEFAULT_XRAY_VLESS_PREFERENCE: XrayVlessPreference = XrayVlessPreference.AllVLESS' app/src/main/java/io/nekohasekai/sagernet/outbound/OutboundFactory.kt
           # Persian: the Logs screen is "reports", not "stats and info".
           sed -i 's|<string name="menu_log">آمار و اطلاعات</string>|<string name="menu_log">گزارش‌ها</string>|' app/src/main/res/values-fa/strings.xml
           {
