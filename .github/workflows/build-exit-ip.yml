@@ -349,6 +349,11 @@ jobs:
         run: |
           set -euo pipefail
           sed -i 's/^PACKAGE_NAME=.*/PACKAGE_NAME=com.shigiprotocol.app/' nb4a.properties
+          # Also a universal APK (every ABI in one file) next to the per-ABI ones.
+          sed -i 's/isUniversalApk = false/isUniversalApk = true/' buildSrc/src/main/kotlin/Helpers.kt
+          grep -q 'isUniversalApk = true' buildSrc/src/main/kotlin/Helpers.kt
+          # Persian: the Logs screen is "reports", not "stats and info".
+          sed -i 's|<string name="menu_log">آمار و اطلاعات</string>|<string name="menu_log">گزارش‌ها</string>|' app/src/main/res/values-fa/strings.xml
           {
             echo "SIGNING_KEYSTORE_B64=MIID7gIBAzCCA5gGCSqGSIb3DQEHAaCCA4kEggOFMIIDgTCCASgGCSqGSIb3DQEHAaCCARkEggEVMIIBETCCAQ0GCyqGSIb3DQEMCgECoIG9MIG6MGYGCSqGSIb3DQEFDTBZMDgGCSqGSIb3DQEFDDArBBR9l4QyN7Xbo8jqvMldFO/pIPg/2wICJxACASAwDAYIKoZIhvcNAgkFADAdBglghkgBZQMEASoEEBflquSN340TwZSgDFKUptAEUKI+OdrACmMbQeOGibtoYodZAYefdpT+EcLhMdEz5VpW1T7lotJfTp/tPwYVFkvojYildokk8WaKYGI6LKk/BClfdeFOFC5takIqaJ7XvSVTMT4wGQYJKoZIhvcNAQkUMQweCgBzAGgAaQBnAGkwIQYJKoZIhvcNAQkVMRQEElRpbWUgMTc5MjQ5NjgyNTQyMjCCAlEGCSqGSIb3DQEHBqCCAkIwggI+AgEAMIICNwYJKoZIhvcNAQcBMGYGCSqGSIb3DQEFDTBZMDgGCSqGSIb3DQEFDDArBBTJGkKoW7sVKQm05FGPAuvXXltKuQICJxACASAwDAYIKoZIhvcNAgkFADAdBglghkgBZQMEASoEELb20OFiMf9JNOGXrz+TvGKAggHAKsa80VGlGveY2/UmoBcUlNW67Vw4ycC9/b9qXAbFXwdMIUahiMyRMw1CUAYZYSZmdi5LgxZkYYYJZSjoluxZpvN7uTlqetTq99aQLbC9g/0Hckzkf+b8ULcsbART076FRmBBW1xWUoFtaMLDFfOXZ6+3uoAw20siZeIhUFaaaCdnQ/ZGk4XIjW0aTu+Sh/4QpYkKnqlnxlp079jp+nGijZPmoLLnMZMyFnzAQMI6rGaB2o5Tl/2OTMxK5FuMIyYq0OfgRwo1UjsnRyb1OTYl8hFs3IDsq9UtFM40yBChMp2Frr87dtRX/c2zPolBHP4jr6SS+cuxvmc5R3lpK6K3u28jWQ8OTUeo2jnvJTRBb1GXHWWSRFnVuGyY05s7ISFsH/5FHsEkvdlIqEAmUabqlKTLAdPTHBbAly61EIZI2yI3KsmViAI+OQCzo0IfRIXMEKU5NrVbLXcLrXfKDs0sg82I4e+YcMSAD8sNi7Tkq7+bRf7VcElMUEBA0C+wplf6GLtsQyxYDO4N4ZXt0ywXHbDaaJT3WFISOJXIWP9As289qK9m/wLEce9yretJT6K6B9eLSxYhJ8O1eG/l19pmyjBNMDEwDQYJYIZIAWUDBAIBBQAEIGCgIXvisoI8lxR23aMgB1xmvKgyFtprik0PWToYCX5cBBTzCT2drWqELit28uz97S6JC6GApQICJxA="
             echo "SIGNING_STORE_PASSWORD=shigiprotocol"
